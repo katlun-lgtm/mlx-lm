@@ -9,7 +9,13 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    attention_scores,
+    create_attention_mask,
+    maybe_dequantize,
+    scaled_dot_product_attention,
+)
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
@@ -143,7 +149,7 @@ class DeepseekV3Attention(nn.Module):
         if cache is not None:
             kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
 
-        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+        pe_scores = attention_scores(q_pe, k_pe, self.scale, cache)
         if mask is not None:
             pe_scores = mx.where(
                 mask,
@@ -154,12 +160,16 @@ class DeepseekV3Attention(nn.Module):
         if L == 1:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
+            sdpa_cache = cache
         else:
+            # The absorbed projections need float latents.
+            kv_latent = maybe_dequantize(kv_latent, cache)
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
+            sdpa_cache = None
 
         output = scaled_dot_product_attention(
-            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
+            q_nope, k, v, cache=sdpa_cache, scale=self.scale, mask=pe_scores
         )
         if L == 1:
             output = self.unembed_out(output)

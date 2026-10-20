@@ -16,6 +16,7 @@ from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import (
     BatchKVCache,
     KVCache,
+    QuantizedKVCache,
     RotatingKVCache,
     make_prompt_cache,
 )
@@ -5260,6 +5261,266 @@ class TestModels(unittest.TestCase):
         from_chunked = model(last, cache=chunked_cache)
         from_oneshot = model(last, cache=oneshot_cache)
         self.assertTrue(mx.allclose(from_chunked, from_oneshot, rtol=1e-4, atol=1e-4))
+
+    def test_quantized_sdpa_gqa_float_mask(self):
+        # GQA float masks: split a per-query-head mask to (n_kv_heads, n_repeats).
+        # Leave other mask shapes as they are. B > 1 catches a wrong reshape.
+        from mlx_lm.models.base import quantized_scaled_dot_product_attention
+
+        group_size, bits = 64, 8
+        # A plain GQA shape, then the absorbed-MLA decode shape: one kv head,
+        # so every query head is a repeat.
+        shapes = ((2, 8, 2, 4, 64, 64), (2, 64, 1, 1, 512, 64))
+        for B, n_q, n_kv, L, S, D in shapes:
+            n_repeats = n_q // n_kv
+            mx.random.seed(0)
+            q = mx.random.normal((B, n_q, L, D))
+            k = mx.random.normal((B, n_kv, S, D))
+            v = mx.random.normal((B, n_kv, S, D))
+            q_k = mx.quantize(k, group_size=group_size, bits=bits)
+            q_v = mx.quantize(v, group_size=group_size, bits=bits)
+
+            kd = mx.repeat(
+                mx.dequantize(*q_k, group_size=group_size, bits=bits), n_repeats, axis=1
+            )
+            vd = mx.repeat(
+                mx.dequantize(*q_v, group_size=group_size, bits=bits), n_repeats, axis=1
+            )
+
+            per_q = 0.1 * mx.random.normal((B, n_q, L, S))
+            masks = {
+                "per query head": per_q,
+                "per kv head": 0.1 * mx.random.normal((B, n_kv, L, S)),
+                "broadcast": 0.1 * mx.random.normal((B, 1, L, S)),
+                "full rank": per_q.reshape(B, n_kv, n_repeats, L, S),
+                "no heads": 0.1 * mx.random.normal((L, S)),
+            }
+            for name, mask in masks.items():
+                with self.subTest(heads=(n_q, n_kv), mask=name):
+                    out = quantized_scaled_dot_product_attention(
+                        q,
+                        q_k,
+                        q_v,
+                        scale=1.0,
+                        mask=mask,
+                        group_size=group_size,
+                        bits=bits,
+                    )
+                    self.assertEqual(out.shape, (B, n_q, L, D))
+
+                    ref_mask = mask
+                    if ref_mask.ndim == 5:
+                        ref_mask = ref_mask.reshape(B, n_q, L, S)
+                    elif ref_mask.ndim == 4 and 1 < ref_mask.shape[-3] < n_q:
+                        ref_mask = mx.repeat(
+                            ref_mask, n_q // ref_mask.shape[-3], axis=-3
+                        )
+                    scores = q @ kd.swapaxes(-1, -2) + ref_mask
+                    ref = mx.softmax(scores, axis=-1, precise=True) @ vd
+                    self.assertTrue(mx.allclose(out, ref, rtol=1e-2, atol=1e-2))
+
+    def test_mla_quantized_cache(self):
+        # Absorbed-MLA attention fetches (packed, scales, biases) tuples from a
+        # quantized cache. Exercise the L == 1 decode path and a multi-token
+        # chunk over an already-quantized cache.
+        from mlx_lm.models import glm4_moe_lite
+
+        args = glm4_moe_lite.ModelArgs.from_dict(
+            {
+                "model_type": "glm4_moe_lite",
+                "vocab_size": 128,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "moe_intermediate_size": 32,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "n_shared_experts": 1,
+                "n_routed_experts": 4,
+                "routed_scaling_factor": 1.0,
+                "kv_lora_rank": 64,
+                "q_lora_rank": 64,
+                "qk_rope_head_dim": 32,
+                "qk_nope_head_dim": 32,
+                "v_head_dim": 32,
+                "topk_method": "noaux_tc",
+                "scoring_func": "sigmoid",
+                "norm_topk_prob": True,
+                "n_group": 1,
+                "topk_group": 1,
+                "num_experts_per_tok": 2,
+                "moe_layer_freq": 1,
+                "first_k_dense_replace": 1,
+                "max_position_embeddings": 256,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
+                "rope_scaling": None,
+                "attention_bias": False,
+                "partial_rotary_factor": 1.0,
+                "tie_word_embeddings": False,
+                "num_nextn_predict_layers": 1,
+            }
+        )
+        mx.random.seed(0)
+        model = glm4_moe_lite.Model(args)
+        model.eval()
+
+        def run(make_cache):
+            mx.random.seed(1)
+            cache = [make_cache() for _ in range(len(model.layers))]
+            outs = [model(mx.random.randint(0, 128, (1, 17)), cache=cache)[:, -1:]]
+            for _ in range(3):
+                outs.append(model(mx.random.randint(0, 128, (1, 1)), cache=cache))
+            outs.append(model(mx.random.randint(0, 128, (1, 9)), cache=cache))
+            return mx.concatenate(outs, axis=1).astype(mx.float32)
+
+        ref = run(KVCache)
+        out = run(lambda: QuantizedKVCache(group_size=32, bits=8))
+        self.assertEqual(out.shape, ref.shape)
+        self.assertTrue(
+            mx.array_equal(mx.argmax(out, axis=-1), mx.argmax(ref, axis=-1))
+        )
+        self.assertLess(mx.max(mx.abs(out - ref)).item(), 0.1)
+
+    def test_mla_hybrid_quantized_cache(self):
+        # Hybrid models with absorbed-MLA full attention layers. Quantize the
+        # KVCache layers and compare with the float cache.
+        configs = [
+            {
+                "model_type": "bailing_hybrid",
+                "hidden_size": 256,
+                "intermediate_size": 512,
+                "moe_intermediate_size": 256,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "num_shared_experts": 1,
+                "n_group": 2,
+                "topk_group": 1,
+                "first_k_dense_replace": 1,
+                "layer_group_size": 2,
+                "group_norm_size": 4,
+                "vocab_size": 128,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
+                "max_position_embeddings": 1000,
+                "routed_scaling_factor": 2.5,
+                "head_dim": 64,
+                "kv_lora_rank": 64,
+                "q_lora_rank": 96,
+                "qk_rope_head_dim": 32,
+                "qk_nope_head_dim": 32,
+                "v_head_dim": 32,
+                "rope_interleave": True,
+                "partial_rotary_factor": 0.5,
+                "use_qk_norm": True,
+                "score_function": "sigmoid",
+                "norm_topk_prob": True,
+                "moe_router_enable_expert_bias": True,
+            },
+            {
+                "model_type": "kimi_linear",
+                "vocab_size": 128,
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "intermediate_size": 128,
+                "head_dim": 32,
+                "rope_theta": 100.0,
+                "rms_norm_eps": 1e-6,
+                "linear_attn_config": {
+                    "num_heads": 8,
+                    "head_dim": 32,
+                    "kda_layers": [1],
+                },
+                "model_max_length": 1000,
+                "num_experts": 2,
+                "moe_intermediate_size": 128,
+                "kv_lora_rank": 32,
+                "qk_nope_head_dim": 16,
+                "qk_rope_head_dim": 32,
+                "v_head_dim": 16,
+            },
+            {
+                "model_type": "kimi_k3",
+                "vocab_size": 128,
+                "num_hidden_layers": 4,
+                "text_config": {
+                    "model_type": "kimi_linear",
+                    "vocab_size": 128,
+                    "hidden_size": 64,
+                    "num_hidden_layers": 4,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "intermediate_size": 96,
+                    "rms_norm_eps": 1e-5,
+                    "hidden_act": "situ",
+                    "activation_situ_beta": 4.0,
+                    "activation_situ_linear_beta": 25.0,
+                    "linear_attn_config": {
+                        "kda_layers": [1, 2, 3],
+                        "full_attn_layers": [4],
+                        "num_heads": 2,
+                        "head_dim": 32,
+                        "short_conv_kernel_size": 4,
+                        "gate_lower_bound": -5.0,
+                        "use_full_rank_gate": True,
+                    },
+                    "num_experts": 8,
+                    "moe_intermediate_size": 32,
+                    "q_lora_rank": 24,
+                    "kv_lora_rank": 32,
+                    "qk_nope_head_dim": 16,
+                    "qk_rope_head_dim": 32,
+                    "v_head_dim": 16,
+                    "mla_use_nope": True,
+                    "mla_use_output_gate": True,
+                    "num_experts_per_token": 2,
+                    "num_shared_experts": 1,
+                    "first_k_dense_replace": 1,
+                    "routed_expert_hidden_size": 32,
+                    "latent_moe_use_norm": True,
+                    "attn_res_block_size": 2,
+                },
+            },
+        ]
+        for config in configs:
+            model_type = config["model_type"]
+            with self.subTest(model_type=model_type):
+                arch = importlib.import_module(f"mlx_lm.models.{model_type}")
+                mx.random.seed(0)
+                model = arch.Model(arch.ModelArgs.from_dict(config))
+                model.eval()
+
+                def run(quantize):
+                    mx.random.seed(1)
+                    cache = model.make_cache()
+                    n_kv = 0
+                    for i, c in enumerate(cache):
+                        if isinstance(c, KVCache):
+                            n_kv += 1
+                            if quantize:
+                                cache[i] = QuantizedKVCache(group_size=32, bits=8)
+                    self.assertGreater(n_kv, 0)
+                    x = mx.random.randint(0, 128, (1, 17))
+                    outs = [model(x, cache=cache)[:, -1:]]
+                    for _ in range(3):
+                        x = mx.random.randint(0, 128, (1, 1))
+                        outs.append(model(x, cache=cache))
+                    x = mx.random.randint(0, 128, (1, 9))
+                    outs.append(model(x, cache=cache))
+                    return mx.concatenate(outs, axis=1).astype(mx.float32)
+
+                ref = run(False)
+                out = run(True)
+                self.assertEqual(out.shape, ref.shape)
+                self.assertTrue(
+                    mx.array_equal(mx.argmax(out, axis=-1), mx.argmax(ref, axis=-1))
+                )
+                self.assertLess(mx.max(mx.abs(out - ref)).item(), 0.1)
 
 
 class TestVLSanitize(unittest.TestCase):

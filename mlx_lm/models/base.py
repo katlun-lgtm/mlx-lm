@@ -90,8 +90,14 @@ def quantized_scaled_dot_product_attention(
             q_indices = mx.arange(kL - qL, kL)
             k_indices = mx.arange(kL)
             mask = q_indices[:, None] >= k_indices[None]
-        if n_repeats > 1 and mask.ndim > 3:
-            mask = mx.expand_dims(mask, -3)
+        if n_repeats > 1 and 3 <= mask.ndim < scores.ndim:
+            if mask.shape[-3] == n_q_heads:
+                # A mask per query head. Split the head axis to match the
+                # scores' (n_kv_heads, n_repeats).
+                mask = mx.unflatten(mask, -3, (n_kv_heads, n_repeats))
+            else:
+                # A mask per kv head, or a broadcast mask. Add the repeats axis.
+                mask = mx.expand_dims(mask, -3)
         if mask.dtype == mx.bool_:
             scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
         else:
@@ -105,6 +111,33 @@ def quantized_scaled_dot_product_attention(
         out = mx.reshape(out, (B, n_q_heads, L, D))
 
     return out
+
+
+def attention_scores(
+    queries: mx.array,
+    keys,
+    scale: float,
+    cache=None,
+) -> mx.array:
+    # Scaled query-key scores. The keys are a (packed, scales, biases) tuple
+    # when they come from a quantized cache.
+    queries = queries * scale
+    if hasattr(cache, "bits"):
+        return mx.quantized_matmul(
+            queries,
+            *keys,
+            transpose=True,
+            group_size=cache.group_size,
+            bits=cache.bits,
+        )
+    return queries @ keys.swapaxes(-1, -2)
+
+
+def maybe_dequantize(x, cache=None):
+    # Float view of an entry fetched from a cache.
+    if hasattr(cache, "bits"):
+        return mx.dequantize(*x, group_size=cache.group_size, bits=cache.bits)
+    return x
 
 
 def scaled_dot_product_attention(
